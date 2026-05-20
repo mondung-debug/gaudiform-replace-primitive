@@ -1,0 +1,91 @@
+{
+  "_comment": "EQP 변환 → 프리미티브 교체(Cube/Cylinder) → Scene Optimizer 최적화",
+  "tasks": [
+    {
+      "_comment": "Task 1: 변환 + 메시 → 프리미티브 교체 (원본 deactivate)",
+      "common": {
+        "scheduling_file_max_count": 8,
+        "input_path": "D:/project/hup/split/EQP",
+        "input_extension": ".usd",
+        "output_directory": "D:/project/hup/split/EQP",
+        "recursive": true
+      },
+      "scheduler": {
+        "resume": { "enable": false },
+        "convert": { "enable": false },
+        "scene_optimizer": { "enable": false },
+        "post_processing": {
+          "enable": true,
+          "operations": [
+            {
+              "_comment": "형태 분석 후 Cube/Cylinder 프리미티브로 교체 (원본 deactivate)",
+              "enable": true,
+              "operation": "external",
+              "script": "C:/path/to/gaudiform-replace-primitive/gaudiform/core/replace_primitive/replace_primitive_operation.py",
+              "params": {
+                "_comment_flat_threshold": "공면성 비율. 0.005=0.5% (낮을수록 엄격)",
+                "flat_threshold": 0.005,
+                "_comment_box_threshold": "BBox 면 이탈 비율. 0.01=1%",
+                "box_threshold": 0.01,
+                "_comment_cyl_threshold": "실린더 반지름 편차 비율. 0.05=5%",
+                "cyl_threshold": 0.05,
+                "skip_paths": []
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "_comment": "Task 2: Scene Optimizer (deactivate된 원본 메시 제외됨)",
+      "common": {
+        "scheduling_file_max_count": 8,
+        "input_path": "D:/project/hup/split/EQP",
+        "input_extension": ".usd",
+        "output_directory": "D:/project/hup/optimized/EQP",
+        "recursive": true
+      },
+      "scheduler": {
+        "resume": { "enable": false },
+        "convert": { "enable": false },
+        "scene_optimizer": {
+          "enable": true,
+          "generateReport": false,
+          "operations": [
+            { "enable": true, "operation": "editStageMetrics",    "preset": "editStageMetrics" },
+            { "enable": true, "operation": "removeAttributes",    "preset": "removeAttributes" },
+            { "enable": true, "operation": "optimizeMaterials",   "preset": "optimizeMaterials" },
+            { "enable": true, "operation": "optimizePrimvars",    "preset": "optimizePrimvars" },
+            { "enable": true, "operation": "removeUntypedPrims",  "preset": "removeUntypedPrims" },
+            { "enable": true, "operation": "deleteHiddenPrims",   "preset": "deleteHiddenPrims" },
+            { "enable": true, "operation": "meshCleanup",         "preset": "meshCleanup" },
+            { "enable": true, "operation": "merge",               "preset": "merge" },
+            { "enable": true, "operation": "generateNormals",     "preset": "generateNormals" },
+            { "enable": true, "operation": "computeExtents",      "preset": "computeExtents" }
+          ]
+        },
+        "post_processing": { "enable": false }
+      }
+    }
+  ],
+  "log": {
+    "enable": true,
+    "directory": "D:/project/logs/replace_primitive"
+  },
+  "cadConverterConfig": {},
+  "sceneOptimizerConfig": {
+    "editStageMetrics": {
+      "metersPerUnit": 0.001,
+      "upAxis": 0,
+      "collapseXforms": false
+    },
+    "meshCleanup": {
+      "paths": [],
+      "mergeVertices": true,
+      "tolerance": 0.0,
+      "mergeBoundaries": true,
+      "removeIsolatedVertices": true,
+      "makeManifold": false
+    }
+  }
+}
