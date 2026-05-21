@@ -4,11 +4,16 @@
 메시 형태를 분석하여 적합한 USD 프리미티브(Cube/Cylinder)로 교체합니다.
 원본 메시는 active=false 처리하여 복구 가능하게 유지합니다.
 
-형태 감지 (PCA/OBB 기반 — 회전된 메시 대응):
-  1. flat     : 공면성 비율 <= flat_threshold  → UsdGeom.Cube (얇은 슬랩)
-  2. box      : OBB 면 이탈 비율 <= box_threshold → UsdGeom.Cube (회전 포함)
-  3. cylinder : PCA 축 기준 반지름 std/mean <= cyl_threshold → UsdGeom.Cylinder
+형태 감지 (PCA/OBB 기반 — 회전/중공 실린더 대응):
+  1. flat     : 공면성 비율 <= flat_threshold
+               → UsdGeom.Cube (얇은 슬랩)
+  2. cylinder : PCA cross-section 등방성(eccentricity) >= cyl_threshold
+               → UsdGeom.Cylinder (solid/hollow 실린더, 파이프 포함)
+  3. box      : OBB 면 이탈 비율 <= box_threshold
+               → UsdGeom.Cube (회전 포함)
   4. unknown  : 위 조건 불충족 → 스킵
+
+검사 순서: flat → cylinder → box (cylinder 먼저 → 파이프가 box로 오감지 방지)
 
 교체 prim 경로: {원본경로}_prim
 원본 메시:       active=false (복구 가능)
@@ -43,9 +48,7 @@ def _flat_ratio(arr: np.ndarray) -> float | None:
     p0 = arr[0]
     normal = None
     for i in range(1, len(arr) - 1):
-        v1 = arr[i]     - p0
-        v2 = arr[i + 1] - p0
-        cross  = np.cross(v1, v2)
+        cross  = np.cross(arr[i] - p0, arr[i + 1] - p0)
         length = float(np.linalg.norm(cross))
         if length > 1e-9:
             normal = cross / length
@@ -54,39 +57,72 @@ def _flat_ratio(arr: np.ndarray) -> float | None:
         return None
     d0       = float(np.dot(normal, p0))
     max_dist = float(np.max(np.abs(arr @ normal - d0)))
-    lo = arr.min(axis=0)
-    hi = arr.max(axis=0)
-    diag = float(np.linalg.norm(hi - lo))
+    diag     = float(np.linalg.norm(arr.max(axis=0) - arr.min(axis=0)))
     return max_dist / diag if diag > 1e-6 else None
 
 
-# ─────────────────────── OBB analysis (PCA 기반) ─────────────────────────
+# ──────────────────── PCA analysis (공통) ────────────────────────────────
+
+def _pca(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """PCA 분석. 반환: (eigenvalues, vecs, projected) — 오름차순 정렬."""
+    centroid = arr.mean(axis=0)
+    centered = arr - centroid
+    cov      = (centered.T @ centered) / len(arr)
+    try:
+        eigenvalues, vecs = np.linalg.eigh(cov)
+    except np.linalg.LinAlgError:
+        return None
+    projected = centered @ vecs
+    return eigenvalues, vecs, projected
+
+
+# ─────────────────── cylinder detector (eccentricity 기반) ───────────────
+
+def _cyl_eccentricity(eigenvalues: np.ndarray) -> tuple[float, int]:
+    """
+    PCA 고유값으로 cross-section 원형 대칭성(등방성) 검사.
+
+    원형 단면 = 두 cross-section 고유값이 거의 같음 = eccentricity ≈ 1.0
+    파이프(중공 실린더)도 동일하게 감지.
+
+    반환: (best_eccentricity, height_axis_idx_in_pca_space)
+    """
+    best_ecc  = 0.0
+    best_axis = 0
+
+    for height_idx in range(3):
+        cross_idx = [i for i in range(3) if i != height_idx]
+        e0 = eigenvalues[cross_idx[0]]
+        e1 = eigenvalues[cross_idx[1]]
+        if e0 < 1e-9 or e1 < 1e-9:
+            continue
+        ecc = min(e0, e1) / max(e0, e1)   # 1.0 = 완전 원형
+        if ecc > best_ecc:
+            best_ecc  = ecc
+            best_axis = height_idx
+
+    return best_ecc, best_axis
+
+
+# ─────────────────────── OBB analysis (box 감지) ─────────────────────────
 
 def _obb_analysis(arr: np.ndarray) -> dict | None:
     """
-    PCA로 주축 계산 → OBB 분석.
-    반환: {ratio, vecs, lo, hi, center_world, projected}
-      vecs    : (3,3) 행렬, 열 = 주축 (eigenvectors, ascending eigenvalue)
-      lo/hi   : OBB 로컬 좌표계에서의 min/max
-      center_world : 월드 좌표계에서의 OBB 중심
-      projected    : (N,3) — 각 점의 OBB 로컬 좌표 투영값
+    PCA 기반 OBB 분석.
+    반환: {ratio, vecs, lo, hi, center_world, dims}
     """
-    centroid = arr.mean(axis=0)
-    centered = arr - centroid
-
-    cov        = (centered.T @ centered) / len(arr)
-    _, vecs    = np.linalg.eigh(cov)          # 열 = 주축, 오름차순 정렬
-    projected  = centered @ vecs              # OBB 로컬 공간 투영
+    result = _pca(arr)
+    if result is None:
+        return None
+    eigenvalues, vecs, projected = result
 
     lo   = projected.min(axis=0)
     hi   = projected.max(axis=0)
     dims = hi - lo
     diag = float(np.linalg.norm(dims))
-
     if diag < 1e-6:
         return None
 
-    # OBB 면 이탈 거리 (max of min-dist-to-face)
     max_d = 0.0
     for row in projected:
         d = min(
@@ -96,44 +132,18 @@ def _obb_analysis(arr: np.ndarray) -> dict | None:
         )
         max_d = max(max_d, d)
 
-    obb_center_local = (lo + hi) / 2
-    center_world     = centroid + vecs @ obb_center_local
+    centroid     = arr.mean(axis=0)
+    center_world = centroid + vecs @ ((lo + hi) / 2)
 
     return {
-        "ratio":        max_d / diag,
-        "vecs":         vecs,
-        "lo":           lo,
-        "hi":           hi,
-        "center_world": center_world,
-        "projected":    projected,
-        "dims":         dims,
+        "ratio":         max_d / diag,
+        "eigenvalues":   eigenvalues,
+        "vecs":          vecs,
+        "lo":            lo,
+        "hi":            hi,
+        "center_world":  center_world,
+        "dims":          dims,
     }
-
-
-# ─────────────────── cylinder detector (PCA 기반) ────────────────────────
-
-def _cyl_pca_ratio(projected: np.ndarray) -> tuple[float, int]:
-    """
-    OBB 로컬 공간에서 각 축을 실린더 높이 축으로 가정,
-    단면 반지름 std/mean으로 실린더 적합도 계산.
-    반환: (best_ratio, best_axis_in_obb_space)
-    """
-    best_ratio = float("inf")
-    best_axis  = 2
-
-    for axis in range(3):
-        r0_idx, r1_idx = [i for i in range(3) if i != axis]
-        radii  = np.sqrt(projected[:, r0_idx] ** 2 + projected[:, r1_idx] ** 2)
-        mean_r = float(radii.mean())
-        if mean_r < 1e-9:
-            continue
-        std_r = float(radii.std())
-        ratio = std_r / mean_r
-        if ratio < best_ratio:
-            best_ratio = ratio
-            best_axis  = axis
-
-    return best_ratio, best_axis
 
 
 # ───────────────────────────── main detector ─────────────────────────────
@@ -142,37 +152,43 @@ def detect_shape(
     prim: Usd.Prim,
     flat_threshold: float = 0.005,
     box_threshold:  float = 0.01,
-    cyl_threshold:  float = 0.05,
+    cyl_threshold:  float = 0.8,
 ) -> tuple[str, dict]:
     """
-    Mesh prim의 형태를 PCA/OBB 기반으로 분석 (회전된 메시 대응).
+    Mesh prim 형태를 PCA 기반으로 분석 (회전·중공 실린더 대응).
+
+    Args:
+        flat_threshold: 공면성 비율 임계값 (기본 0.005 = 0.5%)
+        box_threshold:  OBB 면 이탈 비율 임계값 (기본 0.01 = 1%)
+        cyl_threshold:  cross-section eccentricity 하한 (기본 0.8, 범위 0~1)
+                        높을수록 엄격 (1.0 = 완전한 원만 감지)
+
     Returns: (shape_type, meta)
-      shape_type: "flat" | "box" | "cylinder" | "unknown"
+      shape_type: "flat" | "cylinder" | "box" | "unknown"
     """
     arr = _get_local_points(prim)
     if arr is None or len(arr) < 4:
         return "unknown", {}
 
-    # 1. flat 검사 (공면성)
+    # 1. flat 검사
     fr = _flat_ratio(arr)
     if fr is not None and fr <= flat_threshold:
-        lo = arr.min(axis=0)
-        hi = arr.max(axis=0)
+        lo, hi = arr.min(axis=0), arr.max(axis=0)
         return "flat", {"lo": lo, "hi": hi, "obb": False}
 
-    # 2. OBB 분석
+    # OBB 공통 분석
     obb = _obb_analysis(arr)
     if obb is None:
         return "unknown", {}
 
+    # 2. cylinder 검사 (box 전에 먼저 — 파이프가 box로 오감지 방지)
+    ecc, cyl_height_axis = _cyl_eccentricity(obb["eigenvalues"])
+    if ecc >= cyl_threshold:
+        return "cylinder", {**obb, "obb": True, "cyl_axis": cyl_height_axis}
+
     # 3. box 검사
     if obb["ratio"] <= box_threshold:
         return "box", {**obb, "obb": True}
-
-    # 4. cylinder 검사 (PCA 공간)
-    cyl_r, cyl_axis = _cyl_pca_ratio(obb["projected"])
-    if cyl_r <= cyl_threshold:
-        return "cylinder", {**obb, "obb": True, "cyl_axis": cyl_axis}
 
     return "unknown", {}
 
@@ -182,31 +198,25 @@ def detect_shape(
 def _rot_to_quatd(R: np.ndarray) -> Gf.Quatd:
     """3x3 회전 행렬(numpy) → Gf.Quatd (Shepperd method)."""
     m  = R
-    tr = m[0,0] + m[1,1] + m[2,2]
+    tr = m[0, 0] + m[1, 1] + m[2, 2]
     if tr > 0:
         s = 0.5 / math.sqrt(tr + 1.0)
         w = 0.25 / s
-        x = (m[2,1] - m[1,2]) * s
-        y = (m[0,2] - m[2,0]) * s
-        z = (m[1,0] - m[0,1]) * s
-    elif m[0,0] > m[1,1] and m[0,0] > m[2,2]:
-        s = 2.0 * math.sqrt(1.0 + m[0,0] - m[1,1] - m[2,2])
-        w = (m[2,1] - m[1,2]) / s
-        x = 0.25 * s
-        y = (m[0,1] + m[1,0]) / s
-        z = (m[0,2] + m[2,0]) / s
-    elif m[1,1] > m[2,2]:
-        s = 2.0 * math.sqrt(1.0 + m[1,1] - m[0,0] - m[2,2])
-        w = (m[0,2] - m[2,0]) / s
-        x = (m[0,1] + m[1,0]) / s
-        y = 0.25 * s
-        z = (m[1,2] + m[2,1]) / s
+        x = (m[2, 1] - m[1, 2]) * s
+        y = (m[0, 2] - m[2, 0]) * s
+        z = (m[1, 0] - m[0, 1]) * s
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = 2.0 * math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2])
+        w = (m[2, 1] - m[1, 2]) / s; x = 0.25 * s
+        y = (m[0, 1] + m[1, 0]) / s; z = (m[0, 2] + m[2, 0]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = 2.0 * math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2])
+        w = (m[0, 2] - m[2, 0]) / s; x = (m[0, 1] + m[1, 0]) / s
+        y = 0.25 * s;                 z = (m[1, 2] + m[2, 1]) / s
     else:
-        s = 2.0 * math.sqrt(1.0 + m[2,2] - m[0,0] - m[1,1])
-        w = (m[1,0] - m[0,1]) / s
-        x = (m[0,2] + m[2,0]) / s
-        y = (m[1,2] + m[2,1]) / s
-        z = 0.25 * s
+        s = 2.0 * math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1])
+        w = (m[1, 0] - m[0, 1]) / s; x = (m[0, 2] + m[2, 0]) / s
+        y = (m[1, 2] + m[2, 1]) / s; z = 0.25 * s
     return Gf.Quatd(w, Gf.Vec3d(x, y, z))
 
 
@@ -243,21 +253,19 @@ def _create_cylinder(stage: Usd.Stage, path: str, meta: dict) -> Usd.Prim:
     lo        = meta["lo"]
     hi        = meta["hi"]
     center    = meta["center_world"]
-    cyl_axis  = meta.get("cyl_axis", 2)  # index in OBB (PCA) space
+    cyl_axis  = meta.get("cyl_axis", 0)   # PCA 공간에서의 높이 축 인덱스
 
-    dims      = hi - lo
-    height    = float(dims[cyl_axis])
-    r_axes    = [i for i in range(3) if i != cyl_axis]
-    radius    = float((dims[r_axes[0]] + dims[r_axes[1]]) / 4)
+    dims     = hi - lo
+    height   = float(dims[cyl_axis])
+    r_axes   = [i for i in range(3) if i != cyl_axis]
 
-    # 실린더 기본 축은 Z. OBB의 cyl_axis 주축이 Z와 얼마나 다른지 반영
-    # 회전: OBB 기준으로 cyl_axis 번 주축 → world Z로 맞춤
-    # 간단하게 전체 OBB rotation 적용 후 axis attribute 사용
+    # 외측 반지름: 두 cross-section 축의 max extent 평균
+    radius = float((dims[r_axes[0]] + dims[r_axes[1]]) / 4)
+
     cyl = UsdGeom.Cylinder.Define(stage, path)
     cyl.GetHeightAttr().Set(height)
     cyl.GetRadiusAttr().Set(radius)
-    # cyl_axis가 OBB 공간의 몇 번 축인지 → "X"/"Y"/"Z" 매핑
-    # OBB 주축 정렬: eigenvalue ascending → 0=가장 분산 작음, 2=가장 큼
+    # PCA 높이 축 → USD cylinder axis 매핑
     cyl.GetAxisAttr().Set(("X", "Y", "Z")[cyl_axis])
     cyl.AddTranslateOp().Set(Gf.Vec3d(*[float(v) for v in center]))
     cyl.AddOrientOp().Set(_rot_to_quatd(vecs))
@@ -277,19 +285,19 @@ def process_stage(
     stage: Usd.Stage,
     flat_threshold: float = 0.005,
     box_threshold:  float = 0.01,
-    cyl_threshold:  float = 0.05,
+    cyl_threshold:  float = 0.8,
     skip_paths:     list[str] | None = None,
     log:            Callable[[str], None] | None = None,
 ) -> tuple[int, int]:
     """
-    stage 내 Mesh prim을 PCA/OBB 형태 분석하여 USD 프리미티브로 교체.
-    회전된 메시(splitMeshes 이후 등)도 올바르게 감지.
+    stage 내 Mesh prim을 형태 분석하여 USD 프리미티브로 교체.
 
     Args:
         stage:          대상 USD Stage
         flat_threshold: 공면성 비율 임계값 (기본 0.005 = 0.5%)
         box_threshold:  OBB 면 이탈 비율 임계값 (기본 0.01 = 1%)
-        cyl_threshold:  실린더 반지름 편차 비율 임계값 (기본 0.05 = 5%)
+        cyl_threshold:  cross-section eccentricity 하한 (기본 0.8)
+                        0.8 = 80% 이상 원형이면 실린더 감지 (파이프 포함)
         skip_paths:     처리 제외할 prim 경로 접두어 목록
         log:            로그 콜백
 
