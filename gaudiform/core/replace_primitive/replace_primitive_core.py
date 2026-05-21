@@ -236,8 +236,8 @@ def detect_shape(
 
 # ─────────────────────── rotation matrix → quaternion ────────────────────
 
-def _rot_to_quatd(R: np.ndarray) -> Gf.Quatd:
-    """3x3 회전 행렬(numpy) → Gf.Quatd (Shepperd method)."""
+def _rot_to_quatd(R: np.ndarray) -> Gf.Quatf:
+    """3x3 회전 행렬(numpy) → Gf.Quatf (Shepperd method)."""
     R = np.asarray(R, dtype=float)
     # eigh는 det=-1(반사 행렬)을 반환할 수 있음 → 마지막 열 반전으로 proper rotation 보장
     if np.linalg.det(R) < 0:
@@ -262,7 +262,7 @@ def _rot_to_quatd(R: np.ndarray) -> Gf.Quatd:
         s = 2.0 * math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1])
         w = (m[1, 0] - m[0, 1]) / s; x = (m[0, 2] + m[2, 0]) / s
         y = (m[1, 2] + m[2, 1]) / s; z = 0.25 * s
-    return Gf.Quatd(w, Gf.Vec3d(x, y, z))
+    return Gf.Quatf(float(w), Gf.Vec3f(float(x), float(y), float(z)))
 
 
 # ─────────────────────────── primitive factory ───────────────────────────
