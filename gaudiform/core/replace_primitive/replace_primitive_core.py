@@ -238,6 +238,10 @@ def detect_shape(
 
 def _rot_to_quatd(R: np.ndarray) -> Gf.Quatd:
     """3x3 회전 행렬(numpy) → Gf.Quatd (Shepperd method)."""
+    R = np.asarray(R, dtype=float)
+    # eigh는 det=-1(반사 행렬)을 반환할 수 있음 → 마지막 열 반전으로 proper rotation 보장
+    if np.linalg.det(R) < 0:
+        R = R.copy(); R[:, 2] = -R[:, 2]
     m  = R
     tr = m[0, 0] + m[1, 1] + m[2, 2]
     if tr > 0:
