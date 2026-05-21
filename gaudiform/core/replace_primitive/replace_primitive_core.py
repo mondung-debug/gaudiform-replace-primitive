@@ -104,6 +104,45 @@ def _cyl_eccentricity(eigenvalues: np.ndarray) -> tuple[float, int]:
     return best_ecc, best_axis
 
 
+# ─────────────────────── pipe detector (bimodal 반지름 분포) ─────────────
+
+def _is_pipe(projected: np.ndarray, cyl_axis: int, gap_threshold: float = 0.25) -> bool:
+    """
+    실린더로 감지된 메시가 파이프(중공 실린더)인지 판별.
+
+    cross-section 반지름 분포가 bimodal(내측+외측 두 원)이면 파이프.
+    - 솔리드 실린더: 포인트가 외측 원에만 몰림 → unimodal
+    - 파이프       : 포인트가 내측+외측 원에 분포 → bimodal + 중간 gap
+
+    Args:
+        projected:     PCA 공간 포인트 (centered)
+        cyl_axis:      높이 축 인덱스 (0/1/2)
+        gap_threshold: 정규화된 최대 gap 임계값 (기본 0.25)
+
+    Returns:
+        True이면 파이프
+    """
+    cross_axes = [i for i in range(3) if i != cyl_axis]
+    cross_pts  = projected[:, cross_axes]
+    radii      = np.linalg.norm(cross_pts, axis=1)
+
+    r_min   = float(radii.min())
+    r_max   = float(radii.max())
+    r_range = r_max - r_min
+    if r_range < 1e-6:
+        return False
+
+    sorted_r     = np.sort(radii)
+    gaps         = np.diff(sorted_r)
+    max_gap_idx  = int(np.argmax(gaps))
+    max_gap      = float(gaps[max_gap_idx])
+    gap_pos      = float(sorted_r[max_gap_idx])           # gap 시작 반지름
+    gap_pos_norm = (gap_pos - r_min) / r_range            # 0~1 정규화
+
+    # gap이 크고 중간 구간에 위치해야 bimodal
+    return (max_gap / r_range) > gap_threshold and 0.1 < gap_pos_norm < 0.9
+
+
 # ─────────────────────── OBB analysis (box 감지) ─────────────────────────
 
 def _obb_analysis(arr: np.ndarray) -> dict | None:
@@ -181,10 +220,12 @@ def detect_shape(
     if obb is None:
         return "unknown", {}
 
-    # 2. cylinder 검사 (box 전에 먼저 — 파이프가 box로 오감지 방지)
+    # 2. cylinder / pipe 검사 (box 전에 먼저 — 파이프가 box로 오감지 방지)
     ecc, cyl_height_axis = _cyl_eccentricity(obb["eigenvalues"])
     if ecc >= cyl_threshold:
-        return "cylinder", {**obb, "obb": True, "cyl_axis": cyl_height_axis}
+        result = _pca(arr)
+        shape_type = "pipe" if (result and _is_pipe(result[2], cyl_height_axis)) else "cylinder"
+        return shape_type, {**obb, "obb": True, "cyl_axis": cyl_height_axis}
 
     # 3. box 검사
     if obb["ratio"] <= box_threshold:
@@ -272,6 +313,34 @@ def _create_cylinder(stage: Usd.Stage, path: str, meta: dict) -> Usd.Prim:
     return cyl.GetPrim()
 
 
+def _apply_prim_xform(prim: Usd.Prim, meta: dict) -> dict:
+    """메시 prim의 local→parent 변환을 meta center/rotation에 적용.
+
+    메시 자체에 xformOp(translate/rotate 등)가 있을 때,
+    교체 프리미티브가 parent 공간에서 올바른 위치·방향을 갖도록 변환.
+    """
+    xformable = UsdGeom.Xformable(prim)
+    M = xformable.GetLocalTransformation()   # Gf.Matrix4d (local → parent)
+
+    if M == Gf.Matrix4d(1.0):               # identity → 변환 불필요
+        return meta
+
+    meta = dict(meta)                        # shallow copy (원본 보호)
+
+    # center 변환: local → parent
+    c = meta["center_world"]
+    c_gf = M.Transform(Gf.Vec3d(float(c[0]), float(c[1]), float(c[2])))
+    meta["center_world"] = np.array([c_gf[0], c_gf[1], c_gf[2]])
+
+    # rotation 결합: R_mesh @ vecs  (PCA 축이 local 공간 기준이므로)
+    if "vecs" in meta:
+        R_gf = M.ExtractRotationMatrix()     # Gf.Matrix3d
+        R_np = np.array([[float(R_gf[r][c_]) for c_ in range(3)] for r in range(3)])
+        meta["vecs"] = R_np @ meta["vecs"]
+
+    return meta
+
+
 def _copy_material(src: Usd.Prim, dst: Usd.Prim) -> None:
     binding = UsdShade.MaterialBindingAPI(src).GetDirectBinding()
     mat     = binding.GetMaterial()
@@ -321,7 +390,7 @@ def process_stage(
     _log(f"{len(meshes)} mesh(es) found")
 
     replaced = skipped = 0
-    counts   = {"flat": 0, "box": 0, "cylinder": 0, "unknown": 0}
+    counts   = {"flat": 0, "box": 0, "cylinder": 0, "pipe": 0, "unknown": 0}
 
     for prim in meshes:
         path_str    = prim.GetPath().pathString
@@ -332,10 +401,14 @@ def process_stage(
             skipped += 1
             continue
 
+        # 메시 자체 xform(회전/이동) 반영
+        if meta.get("obb") or meta.get("center_world") is not None:
+            meta = _apply_prim_xform(prim, meta)
+
         prim_path = path_str + "_prim"
 
         try:
-            if shape == "cylinder":
+            if shape in ("cylinder", "pipe"):
                 new_prim = _create_cylinder(stage, prim_path, meta)
             else:
                 new_prim = _create_cube(stage, prim_path, meta)
@@ -351,6 +424,7 @@ def process_stage(
     _log(
         f"replaced: {replaced} / skipped: {skipped} "
         f"(flat={counts['flat']}, box={counts['box']}, "
-        f"cylinder={counts['cylinder']}, unknown={counts['unknown']})"
+        f"cylinder={counts['cylinder']}, pipe={counts['pipe']}, "
+        f"unknown={counts['unknown']})"
     )
     return replaced, skipped
