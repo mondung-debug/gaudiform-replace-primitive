@@ -1,19 +1,16 @@
 # -*- coding: utf-8 -*-
 """ReplacePrimitive core logic.
 
-메시 형태를 분석하여 적합한 USD 프리미티브(Cube/Cylinder)로 교체합니다.
+메시 형태를 분석하여 적합한 USD 프리미티브(Cylinder)로 교체합니다.
 원본 메시는 active=false 처리하여 복구 가능하게 유지합니다.
 
 형태 감지 (PCA/OBB 기반 — 회전/중공 실린더 대응):
-  1. flat     : 공면성 비율 <= flat_threshold
-               → UsdGeom.Cube (얇은 슬랩)
+  1. flat     : 공면성 비율 <= flat_threshold → skip
   2. cylinder : PCA cross-section 등방성(eccentricity) >= cyl_threshold
-               → UsdGeom.Cylinder (solid/hollow 실린더, 파이프 포함)
-  3. box      : OBB 면 이탈 비율 <= box_threshold
-               → UsdGeom.Cube (회전 포함)
+               → UsdGeom.Cylinder (solid 실린더)
+  3. pipe     : cylinder 조건 + bimodal 반지름 분포
+               → UsdGeom.Cylinder (중공 실린더)
   4. unknown  : 위 조건 불충족 → 스킵
-
-검사 순서: flat → cylinder → box (cylinder 먼저 → 파이프가 box로 오감지 방지)
 
 교체 prim 경로: {원본경로}_prim
 원본 메시:       active=false (복구 가능)
@@ -190,46 +187,39 @@ def _obb_analysis(arr: np.ndarray) -> dict | None:
 def detect_shape(
     prim: Usd.Prim,
     flat_threshold: float = 0.005,
-    box_threshold:  float = 0.01,
     cyl_threshold:  float = 0.8,
 ) -> tuple[str, dict]:
     """
     Mesh prim 형태를 PCA 기반으로 분석 (회전·중공 실린더 대응).
 
     Args:
-        flat_threshold: 공면성 비율 임계값 (기본 0.005 = 0.5%)
-        box_threshold:  OBB 면 이탈 비율 임계값 (기본 0.01 = 1%)
+        flat_threshold: 공면성 비율 임계값 (기본 0.005 = 0.5%) — flat이면 skip
         cyl_threshold:  cross-section eccentricity 하한 (기본 0.8, 범위 0~1)
                         높을수록 엄격 (1.0 = 완전한 원만 감지)
 
     Returns: (shape_type, meta)
-      shape_type: "flat" | "cylinder" | "box" | "unknown"
+      shape_type: "cylinder" | "pipe" | "unknown"
     """
     arr = _get_local_points(prim)
     if arr is None or len(arr) < 4:
         return "unknown", {}
 
-    # 1. flat 검사
+    # flat 검사 — skip 대상
     fr = _flat_ratio(arr)
     if fr is not None and fr <= flat_threshold:
-        lo, hi = arr.min(axis=0), arr.max(axis=0)
-        return "flat", {"lo": lo, "hi": hi, "obb": False}
+        return "flat", {}
 
     # OBB 공통 분석
     obb = _obb_analysis(arr)
     if obb is None:
         return "unknown", {}
 
-    # 2. cylinder / pipe 검사 (box 전에 먼저 — 파이프가 box로 오감지 방지)
+    # cylinder / pipe 검사
     ecc, cyl_height_axis = _cyl_eccentricity(obb["eigenvalues"])
     if ecc >= cyl_threshold:
         result = _pca(arr)
         shape_type = "pipe" if (result and _is_pipe(result[2], cyl_height_axis)) else "cylinder"
         return shape_type, {**obb, "obb": True, "cyl_axis": cyl_height_axis}
-
-    # 3. box 검사
-    if obb["ratio"] <= box_threshold:
-        return "box", {**obb, "obb": True}
 
     return "unknown", {}
 
@@ -357,20 +347,17 @@ def _copy_material(src: Usd.Prim, dst: Usd.Prim) -> None:
 def process_stage(
     stage: Usd.Stage,
     flat_threshold: float = 0.005,
-    box_threshold:  float = 0.01,
     cyl_threshold:  float = 0.8,
     skip_paths:     list[str] | None = None,
     log:            Callable[[str], None] | None = None,
 ) -> tuple[int, int]:
     """
-    stage 내 Mesh prim을 형태 분석하여 USD 프리미티브로 교체.
+    stage 내 Mesh prim을 형태 분석하여 UsdGeom.Cylinder로 교체.
 
     Args:
         stage:          대상 USD Stage
-        flat_threshold: 공면성 비율 임계값 (기본 0.005 = 0.5%)
-        box_threshold:  OBB 면 이탈 비율 임계값 (기본 0.01 = 1%)
+        flat_threshold: 공면성 비율 임계값 (기본 0.005 = 0.5%) — flat이면 skip
         cyl_threshold:  cross-section eccentricity 하한 (기본 0.8)
-                        0.8 = 80% 이상 원형이면 실린더 감지 (파이프 포함)
         skip_paths:     처리 제외할 prim 경로 접두어 목록
         log:            로그 콜백
 
@@ -394,14 +381,14 @@ def process_stage(
     _log(f"{len(meshes)} mesh(es) found")
 
     replaced = skipped = 0
-    counts   = {"flat": 0, "box": 0, "cylinder": 0, "pipe": 0, "unknown": 0}
+    counts   = {"flat": 0, "cylinder": 0, "pipe": 0, "unknown": 0}
 
     for prim in meshes:
         path_str    = prim.GetPath().pathString
-        shape, meta = detect_shape(prim, flat_threshold, box_threshold, cyl_threshold)
+        shape, meta = detect_shape(prim, flat_threshold, cyl_threshold)
         counts[shape] = counts.get(shape, 0) + 1
 
-        if shape == "unknown":
+        if shape not in ("cylinder", "pipe"):
             skipped += 1
             continue
 
@@ -412,11 +399,7 @@ def process_stage(
         prim_path = path_str + "_prim"
 
         try:
-            if shape in ("cylinder", "pipe"):
-                new_prim = _create_cylinder(stage, prim_path, meta)
-            else:
-                new_prim = _create_cube(stage, prim_path, meta)
-
+            new_prim = _create_cylinder(stage, prim_path, meta)
             _copy_material(prim, new_prim)
             prim.SetActive(False)
             _log(f"[{shape.upper()}] {path_str} → {prim_path}")
@@ -427,8 +410,7 @@ def process_stage(
 
     _log(
         f"replaced: {replaced} / skipped: {skipped} "
-        f"(flat={counts['flat']}, box={counts['box']}, "
-        f"cylinder={counts['cylinder']}, pipe={counts['pipe']}, "
-        f"unknown={counts['unknown']})"
+        f"(cylinder={counts['cylinder']}, pipe={counts['pipe']}, "
+        f"flat={counts['flat']}, unknown={counts['unknown']})"
     )
     return replaced, skipped
