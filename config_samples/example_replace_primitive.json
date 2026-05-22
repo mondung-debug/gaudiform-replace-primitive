@@ -1,8 +1,8 @@
 {
-  "_comment": "EQP 변환 → 프리미티브 교체(Cube/Cylinder) → Scene Optimizer 최적화",
+  "_comment": "EQP → 실린더/파이프 메시 교체(Cylinder) → Scene Optimizer 최적화",
   "tasks": [
     {
-      "_comment": "Task 1: 변환 + 메시 → 프리미티브 교체 (원본 deactivate)",
+      "_comment": "Task 1: 실린더/파이프 메시 → UsdGeom.Cylinder 교체",
       "common": {
         "scheduling_file_max_count": 8,
         "input_path": "D:/project/hup/split/EQP",
@@ -18,17 +18,15 @@
           "enable": true,
           "operations": [
             {
-              "_comment": "형태 분석 후 Cube/Cylinder 프리미티브로 교체 (원본 deactivate)",
+              "_comment": "실린더/파이프 형태 메시 → UsdGeom.Cylinder 프리미티브로 교체",
               "enable": true,
               "operation": "external",
               "script": "C:/path/to/gaudiform-replace-primitive/gaudiform/core/replace_primitive/replace_primitive_operation.py",
               "params": {
-                "_comment_flat_threshold": "공면성 비율. 0.005=0.5% (낮을수록 엄격)",
+                "_comment_flat_threshold": "공면성 비율. 0.005=0.5% (낮을수록 엄격, flat 메시 스킵 기준)",
                 "flat_threshold": 0.005,
-                "_comment_box_threshold": "BBox 면 이탈 비율. 0.01=1%",
-                "box_threshold": 0.01,
-                "_comment_cyl_threshold": "실린더 반지름 편차 비율. 0.05=5%",
-                "cyl_threshold": 0.05,
+                "_comment_cyl_threshold": "실린더 단면 등방성(eccentricity) 임계값. 0.8=80% 이상이면 실린더로 판정",
+                "cyl_threshold": 0.8,
                 "skip_paths": []
               }
             }
